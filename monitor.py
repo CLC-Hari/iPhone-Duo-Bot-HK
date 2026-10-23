@@ -1,7 +1,7 @@
 """Hourly Apple Store Hong Kong pickup monitor.
 
-Watches one public product — iPhone Duo 7.6-inch, 512GB, starlight white —
-and prints whether each Hong Kong Apple Store can fulfill in-store pickup.
+Watches every iPhone Duo storage size and both colors, and prints whether
+each Hong Kong Apple Store can fulfill in-store pickup.
 
 This script only reads the same availability response Apple's own product
 page uses. It sends one request per hour. It does not sign in, add anything
@@ -24,12 +24,23 @@ import winsound
 from datetime import datetime
 from pathlib import Path
 
-PART_NUMBER = "MK2F4ZA/A"
-PRODUCT_NAME = "iPhone Duo 512GB 星光白色"
-PRODUCT_URL = (
-    "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-duo/"
-    "7.6-吋顯示器-512gb-星光白色"
+# Every iPhone Duo sold on the Hong Kong store, in storage then color order.
+# The buy link is shown only when that model is available for pickup.
+_BUY = "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-duo/7.6-吋顯示器-"
+MODELS = (
+    ("MK2D4ZA/A", _BUY + "256gb-星光白色"),
+    ("MK2E4ZA/A", _BUY + "256gb-夜空色"),
+    ("MK2F4ZA/A", _BUY + "512gb-星光白色"),
+    ("MK2G4ZA/A", _BUY + "512gb-夜空色"),
+    ("MK2H4ZA/A", _BUY + "1tb-星光白色"),
+    ("MK2J4ZA/A", _BUY + "1tb-夜空色"),
+    ("MK2K4ZA/A", _BUY + "2tb-星光白色"),
+    ("MK2L4ZA/A", _BUY + "2tb-夜空色"),
 )
+PART_NUMBERS = tuple(part_number for part_number, _url in MODELS)
+MODEL_URLS = dict(MODELS)
+PRODUCT_NAME = "iPhone Duo"
+PRODUCT_URL = "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-duo"
 # "Central" returns every Hong Kong Apple Store in a single response.
 LOCATION = "Central"
 PICKUP_URL = "https://www.apple.com/hk-zh/shop/retail/pickup-message"
@@ -61,13 +72,10 @@ def interval_seconds(requested: int) -> int:
 
 
 def fetch_pickup() -> dict:
-    query = urllib.parse.urlencode(
-        {
-            "pl": "true",
-            "parts.0": PART_NUMBER,
-            "location": LOCATION,
-        }
-    )
+    params = {"pl": "true", "location": LOCATION}
+    for index, part_number in enumerate(PART_NUMBERS):
+        params[f"parts.{index}"] = part_number
+    query = urllib.parse.urlencode(params)
     request = urllib.request.Request(
         f"{PICKUP_URL}?{query}",
         headers={
@@ -120,71 +128,88 @@ def is_available(part: dict) -> bool:
     return bool(regular.get("storeSelectionEnabled"))
 
 
+def part_row(store: dict, part_number: str, part: dict | None) -> dict:
+    store_name = store.get("storeName") or "Unknown store"
+    store_number = store.get("storeNumber") or ""
+    if not isinstance(part, dict):
+        return {
+            "part_number": part_number,
+            "store_number": store_number,
+            "store_name": store_name,
+            "available": False,
+            "status": "no availability data",
+            "title": part_number,
+        }
+    regular = (part.get("messageTypes") or {}).get("regular") or {}
+    quote = plain_text(regular.get("storePickupQuote") or part.get("pickupSearchQuote"))
+    return {
+        "part_number": part_number,
+        "store_number": store_number,
+        "store_name": store_name,
+        "available": is_available(part),
+        "status": quote or plain_text(part.get("pickupDisplay")) or "unknown",
+        "title": plain_text(regular.get("storePickupProductTitle")) or part_number,
+    }
+
+
 def parse_stores(body: dict) -> list[dict]:
     rows = []
     for store in body["stores"]:
         parts = store.get("partsAvailability") or {}
-        part = parts.get(PART_NUMBER)
-        if not isinstance(part, dict):
-            rows.append(
-                {
-                    "store_number": store.get("storeNumber") or "",
-                    "store_name": store.get("storeName") or "Unknown store",
-                    "available": False,
-                    "status": "no availability data",
-                    "title": PRODUCT_NAME,
-                }
-            )
-            continue
-        regular = (part.get("messageTypes") or {}).get("regular") or {}
-        quote = plain_text(
-            regular.get("storePickupQuote") or part.get("pickupSearchQuote")
-        )
-        rows.append(
-            {
-                "store_number": store.get("storeNumber") or "",
-                "store_name": store.get("storeName") or "Unknown store",
-                "available": is_available(part),
-                "status": quote or plain_text(part.get("pickupDisplay")) or "unknown",
-                "title": plain_text(regular.get("storePickupProductTitle"))
-                or PRODUCT_NAME,
-            }
-        )
+        for part_number in PART_NUMBERS:
+            rows.append(part_row(store, part_number, parts.get(part_number)))
     if not rows:
         raise CheckError("Apple returned an empty store list.")
     return rows
 
 
-def format_report(rows: list[dict], checked_at: datetime) -> str:
-    title = rows[0]["title"]
-    lines = [
-        f"{checked_at.strftime('%Y-%m-%d %H:%M:%S')}  {title}  ({PART_NUMBER})",
-    ]
+def models_in_order(rows: list[dict]) -> list[tuple[str, list[dict]]]:
+    grouped: dict[str, list[dict]] = {}
     for row in rows:
-        flag = "AVAILABLE" if row["available"] else "unavailable"
-        lines.append(f"  {row['store_name']:<18} {flag:<12} {row['status']}")
-    available = [row["store_name"] for row in rows if row["available"]]
-    if available:
-        lines.append("In stock for pickup: " + ", ".join(available))
-        lines.append(PRODUCT_URL)
+        grouped.setdefault(row["part_number"], []).append(row)
+    return [(part_number, grouped[part_number]) for part_number in PART_NUMBERS if part_number in grouped]
+
+
+def format_report(rows: list[dict], checked_at: datetime) -> str:
+    lines = [
+        f"{checked_at.strftime('%Y-%m-%d %H:%M:%S')}  {PRODUCT_NAME}  "
+        f"({len(PART_NUMBERS)} models)",
+    ]
+    any_available = False
+    for part_number, group in models_in_order(rows):
+        lines.append("")
+        lines.append(f"{group[0]['title']}  ({part_number})")
+        model_available = False
+        for row in group:
+            flag = "AVAILABLE" if row["available"] else "unavailable"
+            if row["available"]:
+                any_available = True
+                model_available = True
+            lines.append(f"  {row['store_name']:<18} {flag:<12} {row['status']}")
+        if model_available:
+            lines.append(f"  {MODEL_URLS[part_number]}")
+    lines.append("")
+    if any_available:
+        lines.append("At least one model is available for pickup.")
     else:
-        lines.append("No Hong Kong Apple Store currently offers pickup.")
+        lines.append("No Hong Kong Apple Store currently offers pickup for these models.")
     return "\n".join(lines)
 
 
 def popup_text(rows: list[dict]) -> tuple[str, str, bool]:
-    available = [row["store_name"] for row in rows if row["available"]]
-    lines = [f"{row['store_name']}: {row['status']}" for row in rows]
-    if available:
-        title = "iPhone Duo pickup available"
-        lines.insert(0, "Available now at: " + ", ".join(available))
-        lines.append("")
-        lines.append(PRODUCT_URL)
-        return title, "\n".join(lines), True
-    title = "iPhone Duo stock check"
-    lines.append("")
-    lines.append("No Hong Kong Apple Store currently offers pickup.")
-    return title, "\n".join(lines), False
+    lines = []
+    any_available = False
+    for part_number, group in models_in_order(rows):
+        available_stores = [row["store_name"] for row in group if row["available"]]
+        if available_stores:
+            any_available = True
+            lines.append(f"{group[0]['title']}: {', '.join(available_stores)}")
+            lines.append(MODEL_URLS[part_number])
+        else:
+            lines.append(f"{group[0]['title']}: no pickup")
+    if any_available:
+        return "iPhone Duo pickup available", "\n".join(lines), True
+    return "iPhone Duo stock check", "\n".join(lines), False
 
 
 def show_desktop_popup(title: str, message: str, *, sound: bool, wait: bool) -> None:
@@ -222,10 +247,12 @@ def load_state() -> dict:
 def save_state(rows: list[dict], checked_at: datetime, failures: int) -> None:
     state = {
         "checked_at": checked_at.isoformat(timespec="seconds"),
-        "part_number": PART_NUMBER,
+        "part_numbers": list(PART_NUMBERS),
         "consecutive_failures": failures,
         "stores": [
             {
+                "part_number": row["part_number"],
+                "title": row["title"],
                 "store_number": row["store_number"],
                 "store_name": row["store_name"],
                 "available": row["available"],
@@ -294,7 +321,7 @@ def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(
-        description="Check Hong Kong Apple Store pickup for iPhone Duo 512GB starlight white."
+        description="Check Hong Kong Apple Store pickup for every iPhone Duo storage size and color."
     )
     parser.add_argument(
         "--once",
