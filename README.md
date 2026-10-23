@@ -1,4 +1,4 @@
-# iPhone Duo store monitor
+# iPhone Duo store monitor - HK Only
 
 Each check looks up every iPhone Duo storage size and both colors at the same time, then opens a window on top of the desktop with the result. If a store has stock, the PC beeps and the popup includes that model's buy link.
 
