@@ -56,6 +56,9 @@ STATE_PATH = ROOT / "state.json"
 LOG_PATH = ROOT / "availability.log"
 
 TAG_RE = re.compile(r"<[^>]+>")
+GREEN = "\033[32m"
+RED = "\033[31m"
+RESET = "\033[0m"
 
 
 class CheckError(Exception):
@@ -128,14 +131,31 @@ def is_available(part: dict) -> bool:
     return bool(regular.get("storeSelectionEnabled"))
 
 
+def store_location(store: dict) -> str:
+    address = store.get("address")
+    if not isinstance(address, dict):
+        return ""
+    parts = [plain_text(address.get("address2")), plain_text(address.get("address3"))]
+    return ", ".join(part for part in parts if part)
+
+
+def store_label(row: dict) -> str:
+    location = row.get("location") or ""
+    if location:
+        return f"{row['store_name']} — {location}"
+    return row["store_name"]
+
+
 def part_row(store: dict, part_number: str, part: dict | None) -> dict:
     store_name = store.get("storeName") or "Unknown store"
     store_number = store.get("storeNumber") or ""
+    location = store_location(store)
     if not isinstance(part, dict):
         return {
             "part_number": part_number,
             "store_number": store_number,
             "store_name": store_name,
+            "location": location,
             "available": False,
             "status": "no availability data",
             "title": part_number,
@@ -146,6 +166,7 @@ def part_row(store: dict, part_number: str, part: dict | None) -> dict:
         "part_number": part_number,
         "store_number": store_number,
         "store_name": store_name,
+        "location": location,
         "available": is_available(part),
         "status": quote or plain_text(part.get("pickupDisplay")) or "unknown",
         "title": plain_text(regular.get("storePickupProductTitle")) or part_number,
@@ -161,6 +182,31 @@ def parse_stores(body: dict) -> list[dict]:
     if not rows:
         raise CheckError("Apple returned an empty store list.")
     return rows
+
+
+def status_mark(available: bool) -> str:
+    return "🟢" if available else "🔴"
+
+
+def enable_console_color() -> None:
+    if sys.platform != "win32":
+        return
+    handle = ctypes.windll.kernel32.GetStdHandle(-11)
+    mode = ctypes.c_uint()
+    if ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        ctypes.windll.kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+
+
+def paint(line: str) -> str:
+    if "🟢" in line:
+        return f"{GREEN}{line}{RESET}"
+    if "🔴" in line:
+        return f"{RED}{line}{RESET}"
+    return line
+
+
+def print_report(report: str) -> None:
+    print("\n".join(paint(line) for line in report.splitlines()), flush=True)
 
 
 def models_in_order(rows: list[dict]) -> list[tuple[str, list[dict]]]:
@@ -185,28 +231,38 @@ def format_report(rows: list[dict], checked_at: datetime) -> str:
             if row["available"]:
                 any_available = True
                 model_available = True
-            lines.append(f"  {row['store_name']:<18} {flag:<12} {row['status']}")
+            lines.append(f"  {status_mark(row['available'])}  {store_label(row)}  {flag}  {row['status']}")
         if model_available:
             lines.append(f"  {MODEL_URLS[part_number]}")
     lines.append("")
     if any_available:
-        lines.append("At least one model is available for pickup.")
+        lines.append(f"{status_mark(True)}  At least one model is available for pickup.")
     else:
-        lines.append("No Hong Kong Apple Store currently offers pickup for these models.")
+        lines.append(f"{status_mark(False)}  No Hong Kong Apple Store currently offers pickup for these models.")
     return "\n".join(lines)
 
 
 def popup_text(rows: list[dict]) -> tuple[str, str, bool]:
     lines = []
     any_available = False
+    seen_stores: list[str] = []
     for part_number, group in models_in_order(rows):
-        available_stores = [row["store_name"] for row in group if row["available"]]
+        for row in group:
+            label = store_label(row)
+            if label not in seen_stores:
+                seen_stores.append(label)
+        available_stores = [row for row in group if row["available"]]
         if available_stores:
             any_available = True
-            lines.append(f"{group[0]['title']}: {', '.join(available_stores)}")
+            lines.append(f"{status_mark(True)} {group[0]['title']}:")
+            lines.extend(f"{status_mark(True)} {store_label(row)}" for row in available_stores)
             lines.append(MODEL_URLS[part_number])
         else:
-            lines.append(f"{group[0]['title']}: no pickup")
+            lines.append(f"{status_mark(False)} {group[0]['title']}: no pickup")
+    if seen_stores:
+        lines.append("")
+        lines.append("Stores:")
+        lines.extend(seen_stores)
     if any_available:
         return "iPhone Duo pickup available", "\n".join(lines), True
     return "iPhone Duo stock check", "\n".join(lines), False
@@ -255,6 +311,7 @@ def save_state(rows: list[dict], checked_at: datetime, failures: int) -> None:
                 "title": row["title"],
                 "store_number": row["store_number"],
                 "store_name": row["store_name"],
+                "location": row.get("location") or "",
                 "available": row["available"],
                 "status": row["status"],
             }
@@ -271,7 +328,7 @@ def run_once(*, wait_for_popup: bool) -> list[dict]:
     checked_at = datetime.now()
     rows = parse_stores(fetch_pickup())
     report = format_report(rows, checked_at)
-    print(report, flush=True)
+    print_report(report)
     append_log(report)
     save_state(rows, checked_at, failures=0)
     title, message, in_stock = popup_text(rows)
@@ -296,8 +353,8 @@ def watch(every_seconds: int) -> None:
             failures += 1
             delay = min(every_seconds * (2 ** (failures - 1)), MAX_BACKOFF_SECONDS)
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            message = f"{stamp}  check failed ({failures}): {exc}"
-            print(message, flush=True)
+            message = f"{stamp}  {status_mark(False)}  check failed ({failures}): {exc}"
+            print_report(message)
             append_log(message)
             save_state([], datetime.now(), failures)
             show_desktop_popup(
@@ -320,6 +377,7 @@ def watch(every_seconds: int) -> None:
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
+    enable_console_color()
     parser = argparse.ArgumentParser(
         description="Check Hong Kong Apple Store pickup for every iPhone Duo storage size and color."
     )
